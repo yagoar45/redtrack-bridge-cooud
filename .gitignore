@@ -1,0 +1,10 @@
+node_modules/
+
+# Segredos: COOUD_WEBHOOK_SECRET e RTK_PTOKEN vivem aqui.
+# Só o .env.example vai pro repo.
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+.DS_Store
