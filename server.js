@@ -101,50 +101,87 @@ function jaProcessado(eventId) {
 // O fallback nunca repassa o valor cru: mandar BRL como USD infla a receita
 // em ~5x, que é pior do que errar 10% numa cotação defasada.
 const FX_TTL_MS = Number(FX_TTL_HOURS) * 60 * 60 * 1000;
-let fxCache = { at: 0, usdbrl: null, eurusd: null };
+let fxCache = { at: 0, usdbrl: null, eurusd: null, fonte: null };
+
+// Dois provedores: o primeiro é global e o segundo é brasileiro. A AwesomeAPI
+// tem a melhor cotação de BRL, mas recusou as chamadas vindas do datacenter do
+// Railway — provedor único vira ponto único de falha.
+const FX_PROVIDERS = [
+  {
+    nome: 'open.er-api',
+    url: 'https://open.er-api.com/v6/latest/USD',
+    extrair: (j) => ({
+      usdbrl: Number(j?.rates?.BRL),
+      eurusd: j?.rates?.EUR ? 1 / Number(j.rates.EUR) : NaN,
+    }),
+  },
+  {
+    nome: 'awesomeapi',
+    url: 'https://economia.awesomeapi.com.br/last/USD-BRL,EUR-USD',
+    extrair: (j) => ({
+      usdbrl: parseFloat(j?.USDBRL?.bid),
+      eurusd: parseFloat(j?.EURUSD?.bid),
+    }),
+  },
+];
+
+const valida = (n) => Number.isFinite(n) && n > 0;
 
 async function getCotacoes() {
   const agora = Date.now();
   if (fxCache.usdbrl && agora - fxCache.at < FX_TTL_MS) return fxCache;
 
-  try {
-    const r = await fetch('https://economia.awesomeapi.com.br/last/USD-BRL,EUR-USD', {
-      signal: AbortSignal.timeout(3000),
-    });
-    const j = await r.json();
-    const usdbrl = parseFloat(j?.USDBRL?.bid);
-    const eurusd = parseFloat(j?.EURUSD?.bid);
-    if (usdbrl > 0 && eurusd > 0) {
-      fxCache = { at: agora, usdbrl, eurusd };
-      return fxCache;
+  for (const p of FX_PROVIDERS) {
+    let bruto = '';
+    try {
+      const r = await fetch(p.url, { signal: AbortSignal.timeout(5000) });
+      bruto = await r.text();
+      const { usdbrl, eurusd } = p.extrair(JSON.parse(bruto));
+
+      // Aceita resultado parcial: USD-BRL é o par que importa para o repasse.
+      // Derrubar os dois porque o EUR falhou seria perder a cotação boa.
+      if (valida(usdbrl)) {
+        fxCache = {
+          at: agora,
+          usdbrl,
+          eurusd: valida(eurusd) ? eurusd : fxCache.eurusd || Number(FX_FALLBACK_EURUSD),
+          fonte: p.nome,
+        };
+        console.log(`[fx] ${p.nome}: USDBRL=${usdbrl.toFixed(4)} EURUSD=${fxCache.eurusd.toFixed(4)}`);
+        return fxCache;
+      }
+      // Sem o corpo da resposta no log, a falha anterior ficou incógnita.
+      console.warn(`[fx] ${p.nome} respondeu sem cotação válida:`, bruto.slice(0, 200));
+    } catch (e) {
+      console.warn(`[fx] ${p.nome} falhou: ${e.message}`, bruto.slice(0, 200));
     }
-    throw new Error('cotação inválida no retorno');
-  } catch (e) {
-    console.error('[fx] falhou, usando fallback:', e.message);
-    return {
-      at: fxCache.at,
-      usdbrl: fxCache.usdbrl || Number(FX_FALLBACK_USDBRL),
-      eurusd: fxCache.eurusd || Number(FX_FALLBACK_EURUSD),
-    };
   }
+
+  console.error('[fx] todos os provedores falharam — usando fallback fixo');
+  return {
+    at: fxCache.at,
+    usdbrl: fxCache.usdbrl || Number(FX_FALLBACK_USDBRL),
+    eurusd: fxCache.eurusd || Number(FX_FALLBACK_EURUSD),
+    fonte: 'fallback',
+  };
 }
 
 // centavos + moeda de origem -> unidades em USD
 async function paraUsd(centavos, moeda) {
   const valor = Number(centavos) / 100;
-  if (!Number.isFinite(valor)) return { usd: 0, taxa: null };
+  if (!Number.isFinite(valor)) return { usd: 0, taxa: null, fonte: null };
 
   const m = String(moeda || '').toLowerCase();
-  if (m === 'usd') return { usd: arredonda(valor), taxa: 1 };
+  if (m === 'usd') return { usd: arredonda(valor), taxa: 1, fonte: 'n/a' };
 
   const fx = await getCotacoes();
-  if (m === 'brl') return { usd: arredonda(valor / fx.usdbrl), taxa: fx.usdbrl };
-  if (m === 'eur') return { usd: arredonda(valor * fx.eurusd), taxa: fx.eurusd };
+  if (m === 'brl') return { usd: arredonda(valor / fx.usdbrl), taxa: fx.usdbrl, fonte: fx.fonte };
+  if (m === 'eur') return { usd: arredonda(valor * fx.eurusd), taxa: fx.eurusd, fonte: fx.fonte };
 
   // Moeda não prevista: registra e repassa sem converter, para não inventar
   // número. Se aparecer no log, é config nova que precisa de tratamento.
   console.warn(`[fx] moeda não tratada: "${m}" — repassando sem conversão`);
-  return { usd: arredonda(valor), taxa: null };
+  return { usd: arredonda(valor), taxa: null, fonte: null };
 }
 
 const arredonda = (n) => Math.round(n * 100) / 100;
@@ -220,7 +257,7 @@ async function processar(evento) {
   }
 
   const centavos = pedido[AMOUNT_FIELD] ?? pedido.amount ?? pedido.total_amount;
-  const { usd, taxa } = await paraUsd(centavos, pedido.currency);
+  const { usd, taxa, fonte } = await paraUsd(centavos, pedido.currency);
 
   try {
     const r = await enviarPostback({
@@ -237,6 +274,7 @@ async function processar(evento) {
       origem: `${Number(centavos) / 100} ${pedido.currency}`,
       enviado: `${usd} USD`,
       taxa,
+      fonte, // "fallback" aqui significa cotação fixa: o valor não é confiável
       resposta: r.corpo,
     });
   } catch (e) {
