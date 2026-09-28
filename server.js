@@ -244,15 +244,17 @@ const EVENTOS_VENDEPAY = {
   'chargeback':      { type: 'chargeback', status: 'refund'   },
 };
 
-// O clickid pode voltar por vários campos, conforme o que foi colocado na
-// URL do checkout. urlParams é a rede de segurança: carrega a query crua.
+// Só campos dedicados de tracking. `utmTerm` está fora de propósito: no
+// offer template desta conta ele carrega {rt_placement}, seguindo o padrão
+// do Utmify. Lê-lo aqui pegaria o placement achando que é clickid — o mesmo
+// erro que quebrou o /preclick, onde utm_term chegava como TEST_PLACEMENT.
+//
+// urlParams é a rede de segurança: carrega a query crua do checkout.
 function clickidVendePay(p) {
-  const direto = p.utmTerm || p.sck || p.src;
+  const direto = p.sck || p.src;
   if (direto) return String(direto);
   const extra = p.urlParams || {};
-  return String(
-    extra.rtkcid || extra.clickid || extra.utm_term || extra.sck || ''
-  );
+  return String(extra.sck || extra.rtkcid || extra.clickid || '');
 }
 
 async function processarVendePay(evento) {
