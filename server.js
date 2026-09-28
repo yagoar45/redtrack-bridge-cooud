@@ -290,7 +290,9 @@ async function processar(evento) {
 
 const app = express();
 
-app.get('/health', (_req, res) => res.json({ ok: true, eventos: eventosVistos.size }));
+// `capturas` só conta quantas chegaram — o conteúdo exige token em /vp-log.
+app.get('/health', (_req, res) =>
+  res.json({ ok: true, eventos: eventosVistos.size, capturas: capturas.length }));
 
 // raw() e não json(): o HMAC é calculado sobre os bytes literais do corpo.
 // Qualquer reserialização quebra a verificação.
@@ -329,6 +331,13 @@ app.post('/cooud', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
 const MAX_CAPTURAS = 20;
 const capturas = [];
 
+function tokenConfere(recebido, esperado) {
+  const a = Buffer.from(String(recebido || ''), 'utf8');
+  const b = Buffer.from(String(esperado || ''), 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
 app.all('/vp', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
   const registro = {
     em: new Date().toISOString(),
@@ -342,7 +351,17 @@ app.all('/vp', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
   capturas.unshift(registro);
   if (capturas.length > MAX_CAPTURAS) capturas.pop();
 
-  console.log('[vendepay] captura:', JSON.stringify(registro, null, 2));
+  // Só um resumo vai para o log: headers carregam a assinatura do VendePay e
+  // o corpo carrega e-mail e valor do cliente. O log do Railway é retido e
+  // visível para quem tem acesso ao projeto; o conteúdo fica na memória,
+  // atrás do token de /vp-log. Os NOMES dos headers vão porque é o que
+  // precisamos para achar o header de assinatura — os valores, não.
+  console.log('[vendepay] captura:', {
+    metodo: registro.metodo,
+    url: registro.url,
+    headers: Object.keys(registro.headers),
+    bytesCorpo: registro.corpo.length,
+  });
   res.status(200).send('ok');
 });
 
@@ -352,7 +371,11 @@ app.get('/vp-log', (req, res) => {
   if (!VP_LOG_TOKEN) {
     return res.status(503).json({ erro: 'defina VP_LOG_TOKEN nas variáveis de ambiente' });
   }
-  if (req.query.k !== VP_LOG_TOKEN) return res.status(403).json({ erro: 'token inválido' });
+  // Comparação em tempo constante: `!==` vaza o número de caracteres
+  // corretos pelo tempo de resposta, e a rota é pública.
+  if (!tokenConfere(req.get('x-vp-token') || req.query.k, VP_LOG_TOKEN)) {
+    return res.status(403).json({ erro: 'token inválido' });
+  }
   res.json({ total: capturas.length, capturas });
 });
 
