@@ -226,6 +226,12 @@ const MOEDAS_VENDEPAY = {
   14: 'pyg', 15: 'chf',
 };
 
+// Guia de integração, seção 8.
+const METODOS_VENDEPAY = {
+  1: 'PIX', 2: 'Boleto', 3: 'Cartão de crédito', 4: 'PayPal',
+  5: 'Apple Pay', 6: 'Google Pay', 7: 'Amazon Pay',
+};
+
 function moedaVendePay(bruto) {
   if (bruto === null || bruto === undefined) return '';
   const texto = String(bruto).trim().toLowerCase();
@@ -301,7 +307,8 @@ async function processarVendePay(evento) {
       sum: usd,
       tipo,
       status: mapeado.status,
-      orderId: evento?.id,
+      // Manda o rótulo, não o código: "PIX" é legível no relatório, "1" não.
+      extras: { sub1: evento?.id, sub2: METODOS_VENDEPAY[evento?.metodoPagamento] },
     });
     console.log(`[vendepay] ok ${tipo} ${chave}`, {
       origem: `${evento?.valorPago} ${iso || '?'}`,
@@ -319,14 +326,21 @@ async function processarVendePay(evento) {
  * Envio ao RedTrack
  * ------------------------------------------------------------------ */
 
-async function enviarPostback({ clickid, sum, tipo, status, orderId }) {
+// `extras` são os Additional parameters da offer source. O nome da chave
+// tem que ser igual ao da coluna "Parameter" no RedTrack (sub1, sub2...),
+// não ao rótulo em "Name/Description" — senão o valor é ignorado em silêncio.
+async function enviarPostback({ clickid, sum, tipo, status, extras = {} }) {
   const params = new URLSearchParams();
   if (RTK_PTOKEN) params.set('ptoken', RTK_PTOKEN);
   params.set('clickid', clickid);
   params.set('sum', String(sum));
   params.set('type', tipo);
   params.set('status', status);
-  if (orderId) params.set('order_id', orderId);
+  for (const [chave, valor] of Object.entries(extras)) {
+    if (valor !== undefined && valor !== null && valor !== '') {
+      params.set(chave, String(valor));
+    }
+  }
 
   const url = `${RTK_POSTBACK_URL}?${params.toString()}`;
   const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
@@ -375,7 +389,7 @@ async function processar(evento) {
       sum: usd,
       tipo: mapeado.type,
       status: mapeado.status,
-      orderId: pedido?.id,
+      extras: { sub1: pedido?.id },
     });
     // A taxa aplicada precisa ficar no log: sem ela, um valor questionado
     // daqui a dois meses vira inauditável.
