@@ -307,8 +307,20 @@ async function processarVendePay(evento) {
       sum: usd,
       tipo,
       status: mapeado.status,
-      // Manda o rótulo, não o código: "PIX" é legível no relatório, "1" não.
-      extras: { sub1: evento?.id, sub2: METODOS_VENDEPAY[evento?.metodoPagamento] },
+      extras: {
+        sub1: evento?.id,
+        // Rótulo em vez do código: "PIX" é legível no relatório, "1" não.
+        sub2: METODOS_VENDEPAY[evento?.metodoPagamento],
+        // sub3..sub7 alimentam o matching da CAPI. Os roles correspondentes
+        // estão na offer source; o RedTrack faz o hash antes de repassar à
+        // plataforma. CPF fica de fora de propósito: melhoraria o match, mas
+        // não justifica trafegar em query string.
+        sub3: evento?.emailComprador,
+        sub4: evento?.telefoneComprador,
+        sub5: evento?.nomeComprador,
+        sub6: evento?.sobrenomeComprador,
+        sub7: evento?.postalCode,
+      },
     });
     console.log(`[vendepay] ok ${tipo} ${chave}`, {
       origem: `${evento?.valorPago} ${iso || '?'}`,
