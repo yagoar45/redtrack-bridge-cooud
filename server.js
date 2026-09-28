@@ -26,6 +26,8 @@ const {
   FX_FALLBACK_EURUSD = '1.08',
   // Protege a leitura das capturas do VendePay. Sem ela a rota fica desligada.
   VP_LOG_TOKEN = '',
+  // Secret do webhook VendePay, comparado com o header x-signature-key.
+  VENDEPAY_WEBHOOK_SECRET = '',
 } = process.env;
 
 if (!COOUD_WEBHOOK_SECRET) {
@@ -168,9 +170,13 @@ async function getCotacoes() {
   };
 }
 
-// centavos + moeda de origem -> unidades em USD
+// centavos + moeda de origem -> unidades em USD (Cooud manda em centavos)
 async function paraUsd(centavos, moeda) {
-  const valor = Number(centavos) / 100;
+  return converterParaUsd(Number(centavos) / 100, moeda);
+}
+
+// valor já em unidades -> USD (VendePay manda 99.9, não 9990)
+async function converterParaUsd(valor, moeda) {
   if (!Number.isFinite(valor)) return { usd: 0, taxa: null, fonte: null };
 
   const m = String(moeda || '').toLowerCase();
@@ -205,6 +211,106 @@ const EVENTOS = {
 function mapearEvento(tipoBruto) {
   const t = String(tipoBruto || '').replace(/^cooud\./, '');
   return EVENTOS[t] || null;
+}
+
+/* ------------------------------------------------------------------ *
+ * VendePay
+ * ------------------------------------------------------------------ */
+
+// Tabela do guia de integração, seção 8. O campo `moeda` chega como número
+// nos eventos de venda e como texto nos de assinatura — às vezes com o
+// código numérico ("1"), às vezes com o ISO legado ("BRL").
+const MOEDAS_VENDEPAY = {
+  1: 'brl', 2: 'usd', 3: 'eur', 4: 'clp', 5: 'pen', 6: 'cop', 7: 'mxn',
+  8: 'cad', 9: 'jpy', 10: 'gbp', 11: 'dkk', 12: 'nok', 13: 'sek',
+  14: 'pyg', 15: 'chf',
+};
+
+function moedaVendePay(bruto) {
+  if (bruto === null || bruto === undefined) return '';
+  const texto = String(bruto).trim().toLowerCase();
+  if (MOEDAS_VENDEPAY[texto]) return MOEDAS_VENDEPAY[texto]; // "1"
+  if (/^[a-z]{3}$/.test(texto)) return texto;                // "brl" legado
+  return MOEDAS_VENDEPAY[Number(bruto)] || '';               // 1
+}
+
+// `type` é o tipo de evento no RedTrack; `status`, o estado do pagamento.
+// pix.gerado e boleto.gerado ficam de fora de propósito: seriam a melhor
+// fonte de InitiateCheckout, mas o disparo pelo JS da pv.html ainda está
+// ativo e ligar os dois contaria o evento em dobro.
+const EVENTOS_VENDEPAY = {
+  'compra.aprovada': { type: 'Purchase',   status: 'approved' },
+  'reembolso':       { type: 'refund',     status: 'refund'   },
+  'chargeback':      { type: 'chargeback', status: 'refund'   },
+};
+
+// O clickid pode voltar por vários campos, conforme o que foi colocado na
+// URL do checkout. urlParams é a rede de segurança: carrega a query crua.
+function clickidVendePay(p) {
+  const direto = p.utmTerm || p.sck || p.src;
+  if (direto) return String(direto);
+  const extra = p.urlParams || {};
+  return String(
+    extra.rtkcid || extra.clickid || extra.utm_term || extra.sck || ''
+  );
+}
+
+async function processarVendePay(evento) {
+  const tipoBruto = String(evento?.event || '');
+  const mapeado = EVENTOS_VENDEPAY[tipoBruto];
+
+  if (!mapeado) {
+    console.log(`[vendepay] evento não mapeado: ${tipoBruto}`);
+    return;
+  }
+
+  // A doc é explícita: X-Webhook-Id identifica a CONFIGURAÇÃO do webhook,
+  // não a entrega. A chave de duplicidade recomendada é evento + id da venda.
+  const chave = `vp:${tipoBruto}:${evento?.id}`;
+  if (jaProcessado(chave)) {
+    console.log(`[vendepay] duplicado ignorado: ${chave}`);
+    return;
+  }
+
+  const clickid = clickidVendePay(evento);
+  if (!clickid) {
+    console.error(`[vendepay] ERRO ${chave} sem clickid — venda não atribuída`, {
+      venda: evento?.id,
+      utmTerm: evento?.utmTerm,
+      sck: evento?.sck,
+      src: evento?.src,
+      urlParams: evento?.urlParams,
+    });
+    return;
+  }
+
+  // valorPago vem em UNIDADES (99.9 = R$ 99,90), não em centavos como no Cooud.
+  const iso = moedaVendePay(evento?.moeda);
+  const { usd, taxa, fonte } = await converterParaUsd(Number(evento?.valorPago), iso);
+
+  // upSell distingue a venda principal do upsell dentro de compra.aprovada.
+  const tipo = mapeado.type === 'Purchase' && evento?.upSell === true
+    ? 'upsell'
+    : mapeado.type;
+
+  try {
+    const r = await enviarPostback({
+      clickid,
+      sum: usd,
+      tipo,
+      status: mapeado.status,
+      orderId: evento?.id,
+    });
+    console.log(`[vendepay] ok ${tipo} ${chave}`, {
+      origem: `${evento?.valorPago} ${iso || '?'}`,
+      enviado: `${usd} USD`,
+      taxa,
+      fonte,
+      resposta: r.corpo,
+    });
+  } catch (e) {
+    console.error(`[vendepay] ERRO postback ${chave}:`, e.message);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -313,6 +419,40 @@ app.post('/cooud', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
   // resposta demorar. O postback ao RedTrack sai fora do ciclo da requisição.
   res.status(200).send('ok');
   processar(evento).catch((e) => console.error('[ERRO] processar:', e));
+});
+
+// O VendePay não assina o corpo: manda o secret em claro no header
+// x-signature-key. Mais fraco que HMAC, mas é o que a plataforma oferece.
+//
+// ⚠️ Entregas que falham NÃO são reenviadas (seção 6 do guia). Diferente do
+// Cooud, não há segunda chance: por isso o 200 sai antes do processamento,
+// e nenhuma falha no postback pode derrubar a resposta.
+app.post('/vendepay', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
+  if (!VENDEPAY_WEBHOOK_SECRET) {
+    console.error('[vendepay] VENDEPAY_WEBHOOK_SECRET não definido');
+    return res.status(503).send('secret not configured');
+  }
+  if (!tokenConfere(req.get('x-signature-key'), VENDEPAY_WEBHOOK_SECRET)) {
+    console.warn('[vendepay] 401 assinatura inválida');
+    return res.status(401).send('invalid signature');
+  }
+
+  let evento;
+  try {
+    evento = JSON.parse(req.body.toString('utf8'));
+  } catch {
+    return res.status(400).send('invalid json');
+  }
+
+  // Ignora as entregas de teste do painel: os valores são sintéticos e
+  // criariam conversão falsa no relatório.
+  if (req.get('x-webhook-test') === 'true') {
+    console.log(`[vendepay] teste do painel ignorado: ${evento?.event}`);
+    return res.status(200).send('ok (test)');
+  }
+
+  res.status(200).send('ok');
+  processarVendePay(evento).catch((e) => console.error('[vendepay] ERRO:', e));
 });
 
 /* ------------------------------------------------------------------ *
