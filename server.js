@@ -24,6 +24,8 @@ const {
   FX_TTL_HOURS = '6',
   FX_FALLBACK_USDBRL = '5.40',
   FX_FALLBACK_EURUSD = '1.08',
+  // Protege a leitura das capturas do VendePay. Sem ela a rota fica desligada.
+  VP_LOG_TOKEN = '',
 } = process.env;
 
 if (!COOUD_WEBHOOK_SECRET) {
@@ -309,6 +311,49 @@ app.post('/cooud', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
   // resposta demorar. O postback ao RedTrack sai fora do ciclo da requisição.
   res.status(200).send('ok');
   processar(evento).catch((e) => console.error('[ERRO] processar:', e));
+});
+
+/* ------------------------------------------------------------------ *
+ * Captura de webhook — VendePay (temporário)
+ * ------------------------------------------------------------------ *
+ * O VendePay não publica documentação de postback, então não dá para
+ * saber o nome das macros nem o formato do corpo. Esta rota registra a
+ * requisição crua para descobrir isso a partir de um evento real.
+ *
+ * Aceita qualquer método: pode ser GET com query string (postback
+ * clássico) ou POST com JSON. Responde 200 sempre — negar faria o
+ * gateway marcar o endpoint como morto e parar de reenviar.
+ *
+ * REMOVER depois que o formato estiver mapeado.
+ */
+const MAX_CAPTURAS = 20;
+const capturas = [];
+
+app.all('/vp', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
+  const registro = {
+    em: new Date().toISOString(),
+    metodo: req.method,
+    url: req.originalUrl,
+    query: req.query,
+    headers: req.headers,
+    corpo: req.body && req.body.length ? req.body.toString('utf8') : '',
+  };
+
+  capturas.unshift(registro);
+  if (capturas.length > MAX_CAPTURAS) capturas.pop();
+
+  console.log('[vendepay] captura:', JSON.stringify(registro, null, 2));
+  res.status(200).send('ok');
+});
+
+// Leitura das capturas pelo navegador, sem precisar abrir o log do Railway.
+// Exige token porque o payload carrega dado de cliente (e-mail, valor, pedido).
+app.get('/vp-log', (req, res) => {
+  if (!VP_LOG_TOKEN) {
+    return res.status(503).json({ erro: 'defina VP_LOG_TOKEN nas variáveis de ambiente' });
+  }
+  if (req.query.k !== VP_LOG_TOKEN) return res.status(403).json({ erro: 'token inválido' });
+  res.json({ total: capturas.length, capturas });
 });
 
 app.listen(PORT, () => console.log(`[boot] bridge ouvindo na porta ${PORT}`));
