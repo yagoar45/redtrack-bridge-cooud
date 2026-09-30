@@ -240,15 +240,51 @@ function moedaVendePay(bruto) {
   return MOEDAS_VENDEPAY[Number(bruto)] || '';               // 1
 }
 
-// `type` é o tipo de evento no RedTrack; `status`, o estado do pagamento.
-// pix.gerado e boleto.gerado ficam de fora de propósito: seriam a melhor
-// fonte de InitiateCheckout, mas o disparo pelo JS da pv.html ainda está
-// ativo e ligar os dois contaria o evento em dobro.
+// No cartão todo checkout termina em exatamente um destes três: aprovada,
+// recusada ou abandonada. Somados, são "quem chegou no checkout" — que é o
+// que InitiateCheckout precisa contar. Com IC só na aprovada a coluna seria
+// uma cópia de Purchase e não responderia nada.
+//
+// pix.gerado e boleto.gerado ficam fora porque o público é cartão-only; se
+// algum dia entrar outro método, basta acrescentá-los com o mesmo spec de IC.
+//
+// `comValor: false` é essencial nos eventos que não são receita. Um IC com o
+// valor da venda somaria no Total Revenue e dobraria o faturamento — foi o
+// que aconteceu com o reembolso do Cooud ($37,04 no lugar de $18,52).
 const EVENTOS_VENDEPAY = {
-  'compra.aprovada': { type: 'Purchase',   status: 'approved' },
-  'reembolso':       { type: 'refund',     status: 'refund'   },
-  'chargeback':      { type: 'chargeback', status: 'refund'   },
+  'carrinho.abandonado': [{ type: 'InitiateCheckout', status: 'approved', comValor: false }],
+  'compra.recusada':     [{ type: 'InitiateCheckout', status: 'approved', comValor: false }],
+  'compra.aprovada': [
+    { type: 'InitiateCheckout', status: 'approved', comValor: false },
+    { type: 'Purchase',         status: 'approved', comValor: true  },
+  ],
+  'reembolso':  [{ type: 'refund',     status: 'refund', comValor: false }],
+  'chargeback': [{ type: 'chargeback', status: 'refund', comValor: false }],
 };
+
+// Os eventos de venda trazem os campos na raiz; carrinho.abandonado aninha em
+// checkout{} e comprador{}, e não tem `id` nem `valorPago`. Sem normalizar,
+// o abandono entraria sem id (quebrando o dedupe) e sem valor.
+function normalizarVendePay(p) {
+  const checkout = p.checkout || {};
+  const comprador = p.comprador || {};
+  const endereco = p.endereco || {};
+  return {
+    id: p.id || p.checkoutId || checkout.id,
+    // checkoutId identifica a sessão de checkout, não a tentativa: é o que
+    // permite deduplicar o IC quando o cartão é recusado e o cliente retenta.
+    checkoutId: p.checkoutId || checkout.id || p.id,
+    moeda: p.moeda != null ? p.moeda : checkout.moeda,
+    valor: p.valorPago != null ? p.valorPago : (checkout.total != null ? checkout.total : checkout.valor),
+    metodo: p.metodoPagamento,
+    email: p.emailComprador || comprador.email,
+    telefone: p.telefoneComprador || comprador.telefone,
+    nome: p.nomeComprador || comprador.nome,
+    sobrenome: p.sobrenomeComprador || comprador.sobrenome,
+    cep: p.postalCode || endereco.cep,
+    upSell: p.upSell === true,
+  };
+}
 
 // Só campos dedicados de tracking. `utmTerm` está fora de propósito: no
 // offer template desta conta ele carrega {rt_placement}, seguindo o padrão
@@ -265,26 +301,18 @@ function clickidVendePay(p) {
 
 async function processarVendePay(evento) {
   const tipoBruto = String(evento?.event || '');
-  const mapeado = EVENTOS_VENDEPAY[tipoBruto];
+  const specs = EVENTOS_VENDEPAY[tipoBruto];
 
-  if (!mapeado) {
+  if (!specs) {
     console.log(`[vendepay] evento não mapeado: ${tipoBruto}`);
     return;
   }
 
-  // A doc é explícita: X-Webhook-Id identifica a CONFIGURAÇÃO do webhook,
-  // não a entrega. A chave de duplicidade recomendada é evento + id da venda.
-  const chave = `vp:${tipoBruto}:${evento?.id}`;
-  if (jaProcessado(chave)) {
-    console.log(`[vendepay] duplicado ignorado: ${chave}`);
-    return;
-  }
+  const p = normalizarVendePay(evento || {});
 
-  const clickid = clickidVendePay(evento);
+  const clickid = clickidVendePay(evento || {});
   if (!clickid) {
-    console.error(`[vendepay] ERRO ${chave} sem clickid — venda não atribuída`, {
-      venda: evento?.id,
-      utmTerm: evento?.utmTerm,
+    console.error(`[vendepay] ERRO ${tipoBruto}:${p.id} sem clickid — não atribuída`, {
       sck: evento?.sck,
       src: evento?.src,
       urlParams: evento?.urlParams,
@@ -293,44 +321,59 @@ async function processarVendePay(evento) {
   }
 
   // valorPago vem em UNIDADES (99.9 = R$ 99,90), não em centavos como no Cooud.
-  const iso = moedaVendePay(evento?.moeda);
-  const { usd, taxa, fonte } = await converterParaUsd(Number(evento?.valorPago), iso);
+  const iso = moedaVendePay(p.moeda);
+  const { usd, taxa, fonte } = await converterParaUsd(Number(p.valor), iso);
 
-  // upSell distingue a venda principal do upsell dentro de compra.aprovada.
-  const tipo = mapeado.type === 'Purchase' && evento?.upSell === true
-    ? 'upsell'
-    : mapeado.type;
+  const extras = {
+    sub1: p.id,
+    // Rótulo em vez do código: "Cartão de crédito" é legível, "3" não.
+    sub2: METODOS_VENDEPAY[p.metodo],
+    // sub3..sub7 alimentam o matching da CAPI. Os roles correspondentes estão
+    // na offer source; o RedTrack faz o hash antes de repassar à plataforma.
+    // CPF fica de fora: melhoraria o match, mas não justifica trafegar em
+    // query string.
+    sub3: p.email,
+    sub4: p.telefone,
+    sub5: p.nome,
+    sub6: p.sobrenome,
+    sub7: p.cep,
+  };
 
-  try {
-    const r = await enviarPostback({
-      clickid,
-      sum: usd,
-      tipo,
-      status: mapeado.status,
-      extras: {
-        sub1: evento?.id,
-        // Rótulo em vez do código: "PIX" é legível no relatório, "1" não.
-        sub2: METODOS_VENDEPAY[evento?.metodoPagamento],
-        // sub3..sub7 alimentam o matching da CAPI. Os roles correspondentes
-        // estão na offer source; o RedTrack faz o hash antes de repassar à
-        // plataforma. CPF fica de fora de propósito: melhoraria o match, mas
-        // não justifica trafegar em query string.
-        sub3: evento?.emailComprador,
-        sub4: evento?.telefoneComprador,
-        sub5: evento?.nomeComprador,
-        sub6: evento?.sobrenomeComprador,
-        sub7: evento?.postalCode,
-      },
-    });
-    console.log(`[vendepay] ok ${tipo} ${chave}`, {
-      origem: `${evento?.valorPago} ${iso || '?'}`,
-      enviado: `${usd} USD`,
-      taxa,
-      fonte,
-      resposta: r.corpo,
-    });
-  } catch (e) {
-    console.error(`[vendepay] ERRO postback ${chave}:`, e.message);
+  for (const spec of specs) {
+    // O upsell é pós-compra, não é início de checkout: pula o IC e troca
+    // Purchase por upsell.
+    if (p.upSell && spec.type === 'InitiateCheckout') continue;
+    const tipo = p.upSell && spec.type === 'Purchase' ? 'upsell' : spec.type;
+
+    // O IC é deduplicado por checkoutId, não por evento: cartão recusado e
+    // depois aprovado são dois eventos da MESMA sessão de checkout, e contar
+    // dois ICs inflaria o topo do funil. Os demais tipos usam o id da venda.
+    //
+    // X-Webhook-Id não serve para nada disso: a doc diz que ele identifica a
+    // configuração do webhook, não a entrega.
+    const chave = tipo === 'InitiateCheckout'
+      ? `vp:ic:${p.checkoutId}`
+      : `vp:${tipo}:${p.id}`;
+
+    if (jaProcessado(chave)) {
+      console.log(`[vendepay] duplicado ignorado: ${chave}`);
+      continue;
+    }
+
+    const sum = spec.comValor ? usd : 0;
+
+    try {
+      const r = await enviarPostback({ clickid, sum, tipo, status: spec.status, extras });
+      console.log(`[vendepay] ok ${tipo} ${chave}`, {
+        origem: spec.comValor ? `${p.valor} ${iso || '?'}` : '(sem valor)',
+        enviado: `${sum} USD`,
+        taxa: spec.comValor ? taxa : null,
+        fonte: spec.comValor ? fonte : null,
+        resposta: r.corpo,
+      });
+    } catch (e) {
+      console.error(`[vendepay] ERRO postback ${chave}:`, e.message);
+    }
   }
 }
 
